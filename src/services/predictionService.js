@@ -117,8 +117,9 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
   }
 
   let confidence = 'baixa (poucos dados históricos)';
-  if (league.sampleSize >= 30) confidence = 'alta';
-  else if (league.sampleSize >= 10) confidence = 'média';
+  const minTeamGames = Math.min(homeStats.played, awayStats.played);
+  if (league.sampleSize >= 30 && minTeamGames >= 3) confidence = 'alta';
+  else if (league.sampleSize >= 10 && minTeamGames >= 2) confidence = 'média';
 
   return {
     sportKey,
