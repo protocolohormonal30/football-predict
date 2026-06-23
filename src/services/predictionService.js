@@ -1,6 +1,7 @@
 const { poissonProbability } = require('../utils/poisson');
 const config = require('../config');
 const footballDataStats = require('./footballDataStatsService');
+const marketOdds = require('./marketOddsService');
 
 const MAX_GOALS = 8; // gols por time considerados na matriz de probabilidade
 
@@ -12,7 +13,7 @@ const MAX_GOALS = 8; // gols por time considerados na matriz de probabilidade
 const SMOOTHING_GAMES = 4;
 
 function round(n) {
-  return Math.round(n * 1000) / 1000;
+  return n == null ? null : Math.round(n * 1000) / 1000;
 }
 
 function smoothedRate(goalsTotal, played, leagueAvg) {
@@ -71,20 +72,54 @@ async function expectedGoals(sportKey, homeTeam, awayTeam) {
     league,
     homeStats: home,
     awayStats: away,
-    source: 'football-data.org',
+    source: 'football-data.org (modelo estatístico)',
   };
 }
 
 /**
- * Gera a previsão completa de uma partida: probabilidades 1X2, over/under
- * e placar mais provável, a partir da distribuição de Poisson.
+ * Gera a previsão completa de uma partida.
+ *
+ * Prioridade: se houver odds reais de mercado disponíveis pra esse confronto
+ * (The Odds API), usa a probabilidade implícita do mercado pra 1X2 e
+ * over/under — é a informação mais confiável que existe, porque já
+ * incorpora tudo que o mercado sabe sobre os times (não só os resultados
+ * desta Copa). O modelo estatístico (football-data.org) continua sendo
+ * usado pra estimar os gols esperados e o placar mais provável, e funciona
+ * como única fonte quando o confronto ainda não tem odds publicadas.
  */
 async function predictMatch(sportKey, homeTeam, awayTeam) {
-  const { expectedHomeGoals, expectedAwayGoals, league, homeStats, awayStats, source } = await expectedGoals(
-    sportKey,
-    homeTeam,
-    awayTeam
-  );
+  const market = await marketOdds.getMarketProbabilities(sportKey, homeTeam, awayTeam).catch(() => null);
+
+  let stats = null;
+  try {
+    stats = await expectedGoals(sportKey, homeTeam, awayTeam);
+  } catch (err) {
+    if (!market) throw err; // sem mercado e sem modelo estatístico: não há o que responder
+  }
+
+  // Caso raro: tem odds de mercado, mas o time não foi encontrado na
+  // football-data.org (não dá pra calcular gols esperados/placar).
+  if (!stats) {
+    return {
+      sportKey,
+      homeTeam,
+      awayTeam,
+      source: 'odds de mercado (The Odds API)',
+      expectedGoals: null,
+      probabilities: {
+        homeWin: round(market.homeWin),
+        draw: round(market.draw),
+        awayWin: round(market.awayWin),
+        over25Goals: round(market.over25Goals),
+        under25Goals: round(market.under25Goals),
+      },
+      mostLikelyScore: null,
+      confidence: `alta (baseado em odds reais de ${market.numBookmakers} casa(s) de apostas)`,
+      basedOn: { numBookmakers: market.numBookmakers },
+    };
+  }
+
+  const { expectedHomeGoals, expectedAwayGoals, league, homeStats, awayStats, source } = stats;
 
   let homeWin = 0;
   let draw = 0;
@@ -116,33 +151,57 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
     }
   }
 
-  let confidence = 'baixa (poucos dados históricos)';
-  const minTeamGames = Math.min(homeStats.played, awayStats.played);
-  if (league.sampleSize >= 30 && minTeamGames >= 3) confidence = 'alta';
-  else if (league.sampleSize >= 10 && minTeamGames >= 2) confidence = 'média';
+  // Se há odds de mercado, elas substituem as probabilidades 1X2 e
+  // over/under calculadas pelo modelo estatístico (mais confiáveis).
+  // O placar mais provável e os gols esperados continuam vindo do modelo
+  // estatístico, já que odds de 1X2 não informam isso diretamente.
+  const probabilities = market
+    ? {
+        homeWin: round(market.homeWin),
+        draw: round(market.draw),
+        awayWin: round(market.awayWin),
+        over25Goals: market.over25Goals != null ? round(market.over25Goals) : round(over25),
+        under25Goals: market.under25Goals != null ? round(market.under25Goals) : round(1 - over25),
+      }
+    : {
+        homeWin: round(homeWin),
+        draw: round(draw),
+        awayWin: round(awayWin),
+        over25Goals: round(over25),
+        under25Goals: round(1 - over25),
+      };
+
+  const finalSource = market
+    ? `odds de mercado (The Odds API, ${market.numBookmakers} casa(s)) + ${source}`
+    : source;
+
+  let confidence;
+  if (market) {
+    confidence = 'alta (baseado em odds reais de mercado)';
+  } else {
+    confidence = 'baixa (poucos dados históricos)';
+    const minTeamGames = Math.min(homeStats.played, awayStats.played);
+    if (league.sampleSize >= 30 && minTeamGames >= 3) confidence = 'alta';
+    else if (league.sampleSize >= 10 && minTeamGames >= 2) confidence = 'média';
+  }
 
   return {
     sportKey,
     homeTeam,
     awayTeam,
-    source,
+    source: finalSource,
     expectedGoals: {
       home: round(expectedHomeGoals),
       away: round(expectedAwayGoals),
     },
-    probabilities: {
-      homeWin: round(homeWin),
-      draw: round(draw),
-      awayWin: round(awayWin),
-      over25Goals: round(over25),
-      under25Goals: round(1 - over25),
-    },
+    probabilities,
     mostLikelyScore: `${bestScore.home}-${bestScore.away}`,
     confidence,
     basedOn: {
       homeMatchesPlayed: homeStats.played,
       awayMatchesPlayed: awayStats.played,
       leagueMatchesSampled: league.sampleSize,
+      ...(market ? { numBookmakers: market.numBookmakers } : {}),
     },
   };
 }
