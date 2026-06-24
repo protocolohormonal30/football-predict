@@ -4,6 +4,7 @@ const footballDataStats = require('./footballDataStatsService');
 const marketOdds = require('./marketOddsService');
 
 const MAX_GOALS = 8; // gols por time considerados na matriz de probabilidade
+const TOP_SCORES_COUNT = 5; // quantos placares exatos retornar, ranqueados
 
 // Nº de "jogos fantasmas" usados para suavizar amostras pequenas (ex: início
 // de Copa do Mundo, time com 1-2 jogos). Sem isso, um time com 0 gols
@@ -12,38 +13,72 @@ const MAX_GOALS = 8; // gols por time considerados na matriz de probabilidade
 // suavização perde peso naturalmente.
 const SMOOTHING_GAMES = 4;
 
+// Ajuste de Dixon & Coles (1997) para placares baixos: na prática, jogos
+// 0-0 e 1-1 acontecem um pouco mais do que um modelo de Poisson
+// independente prevê, e jogos 1-0/0-1 um pouco menos (times "se ajustam"
+// um ao outro em jogos truncados). RHO é um valor típico da literatura de
+// futebol europeu — não foi re-estimado com dados desta Copa (amostra
+// pequena demais pra isso); é um refinamento pequeno que deixa os placares
+// exatos mais realistas, sem mudar o favorito do confronto.
+const DIXON_COLES_RHO = -0.1;
+
 function round(n) {
   return n == null ? null : Math.round(n * 1000) / 1000;
 }
 
+function dixonColesTau(h, a, lambdaHome, lambdaAway, rho) {
+  if (h === 0 && a === 0) return 1 - lambdaHome * lambdaAway * rho;
+  if (h === 0 && a === 1) return 1 + lambdaHome * rho;
+  if (h === 1 && a === 0) return 1 + lambdaAway * rho;
+  if (h === 1 && a === 1) return 1 - rho;
+  return 1;
+}
+
 /**
  * Dado um par de gols esperados (casa/fora), calcula a distribuição
- * completa via Poisson: probabilidades 1X2, over 2.5 e o placar mais
- * provável. Usada tanto pelo modelo estatístico quanto pela calibração de
- * mercado, garantindo que os dois caminhos produzam resultados consistentes
- * entre "gols esperados", "placar mais provável" e as probabilidades.
+ * completa de placares (com o ajuste de Dixon-Coles pra placares baixos):
+ * probabilidades 1X2, over 2.5, o ranking dos placares exatos mais
+ * prováveis e o placar mais provável. Usada tanto pelo modelo estatístico
+ * quanto pela calibração de mercado, garantindo que os dois caminhos
+ * produzam resultados consistentes entre si.
  */
 function analyzeScoreDistribution(lambdaHome, lambdaAway, maxGoals = MAX_GOALS) {
+  const raw = [];
+  let total = 0;
+
+  for (let h = 0; h <= maxGoals; h++) {
+    for (let a = 0; a <= maxGoals; a++) {
+      const base = poissonProbability(h, lambdaHome) * poissonProbability(a, lambdaAway);
+      const tau = dixonColesTau(h, a, lambdaHome, lambdaAway, DIXON_COLES_RHO);
+      const p = Math.max(base * tau, 0);
+      raw.push({ h, a, p });
+      total += p;
+    }
+  }
+
   let homeWin = 0;
   let draw = 0;
   let awayWin = 0;
   let over25 = 0;
-  let bestScore = { home: 0, away: 0, prob: 0 };
 
-  for (let h = 0; h <= maxGoals; h++) {
-    for (let a = 0; a <= maxGoals; a++) {
-      const p = poissonProbability(h, lambdaHome) * poissonProbability(a, lambdaAway);
+  const scored = raw.map(({ h, a, p }) => {
+    const probability = total > 0 ? p / total : 0;
+    if (h > a) homeWin += probability;
+    else if (h === a) draw += probability;
+    else awayWin += probability;
+    if (h + a > 2.5) over25 += probability;
+    return { home: h, away: a, probability };
+  });
 
-      if (h > a) homeWin += p;
-      else if (h === a) draw += p;
-      else awayWin += p;
+  scored.sort((x, y) => y.probability - x.probability);
 
-      if (h + a > 2.5) over25 += p;
-      if (p > bestScore.prob) bestScore = { home: h, away: a, prob: p };
-    }
-  }
+  const bestScore = scored[0];
+  const topScores = scored.slice(0, TOP_SCORES_COUNT).map((s) => ({
+    score: `${s.home}-${s.away}`,
+    probability: round(s.probability),
+  }));
 
-  return { homeWin, draw, awayWin, over25, bestScore };
+  return { homeWin, draw, awayWin, over25, bestScore, topScores };
 }
 
 function smoothedRate(goalsTotal, played, leagueAvg) {
@@ -72,16 +107,14 @@ function computeExpectedGoalsFromStats(league, home, away) {
 
 /**
  * Busca, por varredura numérica, o par de gols esperados (casa/fora) cuja
- * distribuição de Poisson reproduz mais de perto as probabilidades 1X2
- * observadas no mercado de apostas. Isso garante que "gols esperados" e
- * "placar mais provável" fiquem SEMPRE consistentes com as probabilidades
- * mostradas — evita o tipo de contradição "time desfavorecido tem mais
- * gols esperados e vence no placar mais provável".
+ * distribuição (já com o ajuste de Dixon-Coles) reproduz mais de perto as
+ * probabilidades 1X2 observadas no mercado de apostas. Isso garante que
+ * "gols esperados", "placar mais provável" e o ranking de placares fiquem
+ * SEMPRE consistentes com as probabilidades mostradas.
  */
 function calibrateExpectedGoalsToMarket(targetHomeWin, targetDraw, maxGoals = MAX_GOALS) {
   let best = { lambdaHome: 1.3, lambdaAway: 1.1, error: Infinity };
 
-  // Varredura grosseira em todo o intervalo plausível de gols esperados
   for (let lh = 0.1; lh <= 5; lh += 0.1) {
     for (let la = 0.1; la <= 5; la += 0.1) {
       const { homeWin, draw } = analyzeScoreDistribution(lh, la, maxGoals);
@@ -90,7 +123,6 @@ function calibrateExpectedGoalsToMarket(targetHomeWin, targetDraw, maxGoals = MA
     }
   }
 
-  // Refinamento fino ao redor do melhor ponto encontrado
   const baseLh = best.lambdaHome;
   const baseLa = best.lambdaAway;
   for (let lh = Math.max(0.05, baseLh - 0.1); lh <= baseLh + 0.1; lh += 0.01) {
@@ -141,15 +173,14 @@ async function expectedGoals(sportKey, homeTeam, awayTeam) {
 }
 
 /**
- * Gera a previsão completa de uma partida.
+ * Gera a previsão completa de uma partida — incluindo o ranking dos
+ * placares exatos mais prováveis, pensado pra bolão de "cravar placar".
  *
  * Prioridade: se houver odds reais de mercado disponíveis pra esse confronto
- * (The Odds API), TUDO na resposta — probabilidades 1X2, over/under, gols
- * esperados e placar mais provável — é derivado/calibrado a partir dessas
+ * (The Odds API), TUDO na resposta é derivado/calibrado a partir dessas
  * odds, pra garantir consistência interna. O modelo estatístico baseado
  * apenas nos jogos desta Copa (football-data.org) só é usado quando não há
- * odds de mercado disponíveis pra esse confronto específico (ex: fases
- * futuras do mata-mata ainda sem odds publicadas).
+ * odds de mercado disponíveis pra esse confronto específico.
  */
 async function predictMatch(sportKey, homeTeam, awayTeam) {
   const market = await marketOdds.getMarketProbabilities(sportKey, homeTeam, awayTeam).catch(() => null);
@@ -163,7 +194,7 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
 
   if (market) {
     const { expectedHomeGoals, expectedAwayGoals } = calibrateExpectedGoalsToMarket(market.homeWin, market.draw);
-    const { over25, bestScore } = analyzeScoreDistribution(expectedHomeGoals, expectedAwayGoals);
+    const { over25, bestScore, topScores } = analyzeScoreDistribution(expectedHomeGoals, expectedAwayGoals);
 
     return {
       sportKey,
@@ -184,6 +215,7 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
         under25Goals: market.under25Goals != null ? round(market.under25Goals) : round(1 - over25),
       },
       mostLikelyScore: `${bestScore.home}-${bestScore.away}`,
+      topScores,
       confidence: 'alta (baseado em odds reais de mercado)',
       basedOn: {
         ...(stats
@@ -200,7 +232,10 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
 
   // Sem odds de mercado disponíveis: usa só o modelo estatístico.
   const { expectedHomeGoals, expectedAwayGoals, league, homeStats, awayStats, source } = stats;
-  const { homeWin, draw, awayWin, over25, bestScore } = analyzeScoreDistribution(expectedHomeGoals, expectedAwayGoals);
+  const { homeWin, draw, awayWin, over25, bestScore, topScores } = analyzeScoreDistribution(
+    expectedHomeGoals,
+    expectedAwayGoals
+  );
 
   let confidence = 'baixa (poucos dados históricos)';
   const minTeamGames = Math.min(homeStats.played, awayStats.played);
@@ -224,6 +259,7 @@ async function predictMatch(sportKey, homeTeam, awayTeam) {
       under25Goals: round(1 - over25),
     },
     mostLikelyScore: `${bestScore.home}-${bestScore.away}`,
+    topScores,
     confidence,
     basedOn: {
       homeMatchesPlayed: homeStats.played,
